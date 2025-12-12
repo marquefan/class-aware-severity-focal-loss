@@ -1,0 +1,16 @@
+[project]
+name = "cafl"
+version = "0.1.0"
+description = "Clinical-Aware Focal Loss (CAFL) for RetinaNet"
+authors = [{ name = "Markus Maier", email = "mmaier@student.tugraz.at" }]
+requires-python = ">=3.9"
+dependencies = ["torch>=2.2", "torchvision>=0.17", "numpy>=1.23"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cafl*"]                # ← only package the cafl namespace
+exclude = ["HAM10000_images*", "subset_ham10000*"]  # ← optional

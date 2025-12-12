@@ -1,0 +1,59 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Data & outputs ----
+data/
+datasets/
+outputs/
+results/
+figures/
+plots/
+subset_ham10000/
+HAM10000_images/
+*.csv
+make_subset.py
+# ---- Logs ----
+*.log
+logs/
+
+# ---- Model checkpoints ----
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Testing ----
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- Packaging ----
+build/
+dist/
+*.egg-info/
+
+# ---- Secrets ----
+.env
+*.key
+*.pem
+
+
