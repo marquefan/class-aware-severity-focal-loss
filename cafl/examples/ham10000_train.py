@@ -19,7 +19,7 @@ from cafl import (
     effective_number_weights, SeverityMap, ClassEmbeddingSimilarity,
 )
 from cafl.adapters.torchvision_retinanet import swap_in_cafl_head
-from cafl.examples.datasets.ham10000_detection import (
+from cafl.examples.ham10000_detection import (
     HAM10000Detection, DEFAULT_CLASS_MAP, det_collate
 )
 
@@ -277,10 +277,9 @@ def evaluate_detector(
     num_classes = len(CLASS_MAP)
     mel_class_id = CLASS_MAP["mel"]
 
-    # Per-class counters (1..K)
     stats = {
         c: {"tp": 0, "fp": 0, "fn": 0}
-        for c in range(1, num_classes + 1)
+        for c in range(num_classes)
     }
     severity_weighted_fn = 0.0
     total_gt = 0
@@ -294,7 +293,7 @@ def evaluate_detector(
 
             for out, tgt in zip(outputs, targets):
                 gt_boxes = tgt["boxes"]
-                gt_labels = tgt["labels"]  # 1..K
+                gt_labels = tgt["labels"]
 
                 total_gt += gt_labels.numel()
 
@@ -325,7 +324,7 @@ def evaluate_detector(
                     continue
 
                 # Greedy matching per class
-                for c in range(1, num_classes + 1):
+                for c in range(num_classes):
                     gt_idx = (gt_labels == c).nonzero(as_tuple=False).flatten()
                     pred_idx = (pred_labels == c).nonzero(as_tuple=False).flatten()
 
@@ -373,7 +372,7 @@ def evaluate_detector(
 
     # derive precision / recall per class
     per_class = {}
-    for c in range(1, num_classes + 1):
+    for c in range(num_classes):
         tp = stats[c]["tp"]
         fp = stats[c]["fp"]
         fn = stats[c]["fn"]

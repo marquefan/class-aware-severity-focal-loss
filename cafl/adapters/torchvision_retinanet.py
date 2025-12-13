@@ -26,8 +26,17 @@ class RetinanetCAFLClassificationHead(RetinaNetClassificationHead):
         logits_all, targets_all, pos_class_all, valid_all = [], [], [], []
         num_pos_local = 0
 
+
+        
+
         for tgt, logits_i, midx in zip(targets, cls_logits, matched_idxs):
             A_i, K = logits_i.shape
+            if (midx >= 0).any():
+                max_idx = int(midx[midx >= 0].max().item())
+                if max_idx >= labels0.numel():
+                    raise ValueError(
+                        f"matched_idxs points past GT labels: max_idx={max_idx}, num_gt={labels0.numel()}"
+                    )
             assert K == self.num_classes
             y = torch.zeros_like(logits_i)
             labels = tgt["labels"].to(dtype=torch.long)       # labels in [1..K]
