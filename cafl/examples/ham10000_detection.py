@@ -6,13 +6,13 @@ from torch.utils.data import Dataset
 from torchvision.transforms.functional import pil_to_tensor
 
 DEFAULT_CLASS_MAP = {
-    "akiec": 0,  # Actinic keratoses / intraepithelial carcinoma
-    "bcc":   1,  # Basal cell carcinoma
-    "bkl":   2,  # Benign keratosis-like lesions
-    "df":    3,  # Dermatofibroma
-    "nv":    4,  # Melanocytic nevi
-    "mel":   5,  # Melanoma
-    "vasc":  6,  # Vascular lesions
+    "akiec": 1,  # Actinic keratoses / intraepithelial carcinoma
+    "bcc":   2,  # Basal cell carcinoma
+    "bkl":   3,  # Benign keratosis-like lesions
+    "df":    4,  # Dermatofibroma
+    "nv":    5,  # Melanocytic nevi
+    "mel":   6,  # Melanoma
+    "vasc":  7,  # Vascular lesions
 }
 
 # Clinical severity scores per class name (higher = more dangerous / urgent).

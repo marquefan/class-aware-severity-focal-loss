@@ -226,6 +226,8 @@ def configure_wandb_metrics(wandb_run) -> None:
         "train/bbox_loss",
         "train/alpha_mean",
         "train/phi_mean",
+        "val/map50_95",
+        "val/map50",
         "val/mel_recall",
         "val/mel_precision",
         "val/overall_recall",
@@ -246,25 +248,29 @@ def evaluate_detector(
     severity_map: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
-    Simple detection evaluation:
+    Detection evaluation:
+    - COCO mAP (IoU 0.5:0.95) and mAP@0.5 via torchmetrics.
     - Per-class TP / FP / FN at IoU >= iou_thresh and score >= score_thresh.
     - Melanoma recall / precision.
     - Severity-weighted false negatives (sum of severity for missed GTs).
     """
+    from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
     if class_map is None:
         class_map = CLASS_MAP
     if severity_map is None:
         severity_map = SEVERITY_ID
     model.eval()
     num_classes = len(class_map)
-    mel_class_id = class_map["mel"]
+    # Model outputs 0-indexed labels (argmax of K logits); dataset labels are
+    # 1-indexed (1..K). mel_class_id is shifted to match model output space.
+    mel_class_id = class_map["mel"] - 1  # 0-indexed
 
-    stats = {
-        c: {"tp": 0, "fp": 0, "fn": 0}
-        for c in range(num_classes)
-    }
+    stats = {c: {"tp": 0, "fp": 0, "fn": 0} for c in range(num_classes)}
     severity_weighted_fn = 0.0
     total_gt = 0
+
+    map_metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
 
     with torch.no_grad():
         for images, targets in data_loader:
@@ -273,48 +279,52 @@ def evaluate_detector(
 
             outputs = model(images)
 
+            # torchmetrics: convert GT labels to 0-indexed to match model output space
+            map_metric.update(
+                preds=[{
+                    "boxes": out["boxes"].cpu(),
+                    "scores": out["scores"].cpu(),
+                    "labels": out["labels"].cpu(),
+                } for out in outputs],
+                target=[{
+                    "boxes": tgt["boxes"].cpu(),
+                    "labels": (tgt["labels"] - 1).cpu(),
+                } for tgt in targets],
+            )
+
             for out, tgt in zip(outputs, targets):
                 gt_boxes = tgt["boxes"]
-                gt_labels = tgt["labels"]
-
+                # Convert GT labels from 1..K (dataset) to 0..K-1 (model output space)
+                gt_labels = tgt["labels"] - 1
                 total_gt += gt_labels.numel()
-
-                if gt_boxes.numel() == 0:
-                    # no GT in this image; all predictions are false positives
-                    pred_labels = out["labels"]
-                    pred_scores = out["scores"]
-                    keep = pred_scores >= score_thresh
-                    for c in pred_labels[keep].tolist():
-                        stats[c]["fp"] += 1
-                    continue
 
                 pred_boxes = out["boxes"]
                 pred_labels = out["labels"]
                 pred_scores = out["scores"]
 
-                # Filter low-confidence predictions
                 keep = pred_scores >= score_thresh
                 pred_boxes = pred_boxes[keep]
                 pred_labels = pred_labels[keep]
                 pred_scores = pred_scores[keep]
 
-                if pred_boxes.numel() == 0:
-                    # no predictions -> all GT are FN
-                    for c in gt_labels.tolist():
-                        stats[c]["fn"] += 1
-                        severity_weighted_fn += severity_map.get(int(c), 1)
+                if gt_boxes.numel() == 0:
+                    for c in pred_labels.tolist():
+                        stats[c]["fp"] += 1
                     continue
 
-                # Greedy matching per class
+                if pred_boxes.numel() == 0:
+                    for c in gt_labels.tolist():
+                        stats[c]["fn"] += 1
+                        severity_weighted_fn += severity_map.get(int(c) + 1, 1)
+                    continue
+
                 for c in range(num_classes):
                     gt_idx = (gt_labels == c).nonzero(as_tuple=False).flatten()
                     pred_idx = (pred_labels == c).nonzero(as_tuple=False).flatten()
 
                     if gt_idx.numel() == 0 and pred_idx.numel() == 0:
                         continue
-
                     if gt_idx.numel() == 0:
-                        # only predictions -> all FP
                         stats[c]["fp"] += int(pred_idx.numel())
                         continue
 
@@ -322,69 +332,59 @@ def evaluate_detector(
                     pred_c_boxes = pred_boxes[pred_idx]
 
                     if pred_c_boxes.numel() == 0:
-                        # only GT -> all FN
                         stats[c]["fn"] += int(gt_idx.numel())
-                        severity_weighted_fn += severity_map.get(int(c), 1) * int(gt_idx.numel())
+                        severity_weighted_fn += severity_map.get(int(c) + 1, 1) * int(gt_idx.numel())
                         continue
 
-                    ious = box_iou(pred_c_boxes, gt_c_boxes)  # (P, G)
-                    # record matches
+                    ious = box_iou(pred_c_boxes, gt_c_boxes)
                     matched_gt = set()
-                    # iterate predictions in descending score order
                     scores_c = pred_scores[pred_idx]
                     order = torch.argsort(scores_c, descending=True)
-
                     for pi in order.tolist():
                         iou_row = ious[pi]
-                        best_iou, gi = (iou_row.max(dim=0))
+                        best_iou, gi = iou_row.max(dim=0)
                         gi = int(gi.item())
                         if best_iou >= iou_thresh and gi not in matched_gt:
-                            # true positive
                             stats[c]["tp"] += 1
                             matched_gt.add(gi)
                         else:
-                            # false positive
                             stats[c]["fp"] += 1
 
-                    # any GT not matched -> FN
                     missed = gt_idx.numel() - len(matched_gt)
                     if missed > 0:
                         stats[c]["fn"] += missed
                         severity_weighted_fn += severity_map.get(int(c), 1) * missed
 
-    # derive precision / recall per class
+    # COCO mAP
+    map_result = map_metric.compute()
+    map50_95 = float(map_result["map"])
+    map50 = float(map_result["map_50"])
+    map_per_class = map_result.get("map_per_class", None)
+
+    # Per-class TP/FP/FN → precision / recall
     per_class = {}
     for c in range(num_classes):
-        tp = stats[c]["tp"]
-        fp = stats[c]["fp"]
-        fn = stats[c]["fn"]
-        prec = tp / (tp + fp + 1e-6)
-        rec = tp / (tp + fn + 1e-6)
+        tp, fp, fn = stats[c]["tp"], stats[c]["fp"], stats[c]["fn"]
         per_class[c] = {
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "precision": prec,
-            "recall": rec,
+            "tp": tp, "fp": fp, "fn": fn,
+            "precision": tp / (tp + fp + 1e-6),
+            "recall": tp / (tp + fn + 1e-6),
         }
 
     mel_stats = per_class[mel_class_id]
-    mel_precision = mel_stats["precision"]
-    mel_recall = mel_stats["recall"]
-
     overall_tp = sum(s["tp"] for s in stats.values())
     overall_fp = sum(s["fp"] for s in stats.values())
     overall_fn = sum(s["fn"] for s in stats.values())
 
-    overall_precision = overall_tp / (overall_tp + overall_fp + 1e-6)
-    overall_recall = overall_tp / (overall_tp + overall_fn + 1e-6)
-
     return {
-        "per_class": per_class,                       # dict[class_id] -> stats
-        "mel_precision": mel_precision,
-        "mel_recall": mel_recall,
-        "overall_precision": overall_precision,
-        "overall_recall": overall_recall,
+        "map50_95": map50_95,
+        "map50": map50,
+        "map_per_class": map_per_class,
+        "per_class": per_class,
+        "mel_precision": mel_stats["precision"],
+        "mel_recall": mel_stats["recall"],
+        "overall_precision": overall_tp / (overall_tp + overall_fp + 1e-6),
+        "overall_recall": overall_tp / (overall_tp + overall_fn + 1e-6),
         "severity_weighted_fn": severity_weighted_fn,
         "total_gt": total_gt,
     }
@@ -725,11 +725,11 @@ def main():
         if val_loader is not None:
             val_metrics = evaluate_detector(model, val_loader, device)
             print(
-                f"val: mel_recall={val_metrics['mel_recall']:.3f}, "
+                f"val: mAP50={val_metrics['map50']:.3f}, "
+                f"mAP50-95={val_metrics['map50_95']:.3f}, "
+                f"mel_recall={val_metrics['mel_recall']:.3f}, "
                 f"mel_prec={val_metrics['mel_precision']:.3f}, "
-                f"overall_recall={val_metrics['overall_recall']:.3f}, "
-                f"overall_prec={val_metrics['overall_precision']:.3f}, "
-                f"severity_weighted_fn={val_metrics['severity_weighted_fn']:.1f}"
+                f"sev_fn={val_metrics['severity_weighted_fn']:.1f}"
             )
 
 
@@ -760,6 +760,8 @@ def main():
                 metrics["train/phi_mean"] = epoch_phi_mean
             if val_metrics is not None:
                 metrics.update({
+                    "val/map50_95": val_metrics["map50_95"],
+                    "val/map50": val_metrics["map50"],
                     "val/mel_recall": val_metrics["mel_recall"],
                     "val/mel_precision": val_metrics["mel_precision"],
                     "val/overall_recall": val_metrics["overall_recall"],
@@ -773,6 +775,25 @@ def main():
             torch.cuda.empty_cache()
 
     print("Training done.")
+
+    # Save final val metrics to JSON for the ablation runner to pick up
+    if val_metrics is not None:
+        import json as _json
+        final = {
+            "loss_mode": args.loss_mode,
+            "map50":     val_metrics["map50"],
+            "map50_95":  val_metrics["map50_95"],
+            "mel_recall":    val_metrics["mel_recall"],
+            "mel_precision": val_metrics["mel_precision"],
+            "overall_recall":    val_metrics["overall_recall"],
+            "overall_precision": val_metrics["overall_precision"],
+            "severity_weighted_fn": val_metrics["severity_weighted_fn"],
+            "total_gt": val_metrics["total_gt"],
+        }
+        metrics_path = checkpoint_dir / "final_metrics.json"
+        with metrics_path.open("w") as _f:
+            _json.dump(final, _f, indent=2)
+        print(f"Final metrics saved: {metrics_path}")
 
     # Export learned similarity matrix
     if similarity is not None:
