@@ -262,7 +262,9 @@ def evaluate_detector(
         severity_map = SEVERITY_ID
     model.eval()
     num_classes = len(class_map)
-    mel_class_id = class_map["mel"]
+    # Model outputs 0-indexed labels (argmax of K logits); dataset labels are
+    # 1-indexed (1..K). mel_class_id is shifted to match model output space.
+    mel_class_id = class_map["mel"] - 1  # 0-indexed
 
     stats = {c: {"tp": 0, "fp": 0, "fn": 0} for c in range(num_classes)}
     severity_weighted_fn = 0.0
@@ -277,8 +279,7 @@ def evaluate_detector(
 
             outputs = model(images)
 
-            # Feed raw (unfiltered) predictions to torchmetrics so it can
-            # compute the full PR curve across all score thresholds.
+            # torchmetrics: convert GT labels to 0-indexed to match model output space
             map_metric.update(
                 preds=[{
                     "boxes": out["boxes"].cpu(),
@@ -287,13 +288,14 @@ def evaluate_detector(
                 } for out in outputs],
                 target=[{
                     "boxes": tgt["boxes"].cpu(),
-                    "labels": tgt["labels"].cpu(),
+                    "labels": (tgt["labels"] - 1).cpu(),
                 } for tgt in targets],
             )
 
             for out, tgt in zip(outputs, targets):
                 gt_boxes = tgt["boxes"]
-                gt_labels = tgt["labels"]
+                # Convert GT labels from 1..K (dataset) to 0..K-1 (model output space)
+                gt_labels = tgt["labels"] - 1
                 total_gt += gt_labels.numel()
 
                 pred_boxes = out["boxes"]
@@ -313,7 +315,7 @@ def evaluate_detector(
                 if pred_boxes.numel() == 0:
                     for c in gt_labels.tolist():
                         stats[c]["fn"] += 1
-                        severity_weighted_fn += severity_map.get(int(c), 1)
+                        severity_weighted_fn += severity_map.get(int(c) + 1, 1)
                     continue
 
                 for c in range(num_classes):
@@ -331,7 +333,7 @@ def evaluate_detector(
 
                     if pred_c_boxes.numel() == 0:
                         stats[c]["fn"] += int(gt_idx.numel())
-                        severity_weighted_fn += severity_map.get(int(c), 1) * int(gt_idx.numel())
+                        severity_weighted_fn += severity_map.get(int(c) + 1, 1) * int(gt_idx.numel())
                         continue
 
                     ious = box_iou(pred_c_boxes, gt_c_boxes)
