@@ -31,16 +31,16 @@ class RetinanetCAFLClassificationHead(RetinaNetClassificationHead):
 
         for tgt, logits_i, midx in zip(targets, cls_logits, matched_idxs):
             A_i, K = logits_i.shape
+            assert K == self.num_classes
+            y = torch.zeros_like(logits_i)
+            labels = tgt["labels"].to(dtype=torch.long)       # labels in [1..K]
+            labels0 = labels - 1                               # to [0..K-1]
             if (midx >= 0).any():
                 max_idx = int(midx[midx >= 0].max().item())
                 if max_idx >= labels0.numel():
                     raise ValueError(
                         f"matched_idxs points past GT labels: max_idx={max_idx}, num_gt={labels0.numel()}"
                     )
-            assert K == self.num_classes
-            y = torch.zeros_like(logits_i)
-            labels = tgt["labels"].to(dtype=torch.long)       # labels in [1..K]
-            labels0 = labels - 1                               # to [0..K-1]
             fg = (midx >= 0)
             bt = (midx == BETWEEN_THRESHOLDS)
             valid = ~bt
@@ -68,10 +68,11 @@ class RetinanetCAFLClassificationHead(RetinaNetClassificationHead):
         # compute similarity per batch (learnable) if provided
         W_sim = self.similarity_module() if self.similarity_module is not None else None
 
-        total, _ = self.cafl(
+        total, parts = self.cafl(
             logits=logits, targets=y, pos_class_idx=pos_class, valid_mask=valid,
             num_pos_global=num_pos_global, W_similarity=W_sim
         )
+        self.last_parts = parts
         return total
 
 def swap_in_cafl_head(model: nn.Module, cafl: CAFLoss, similarity_module: Optional[nn.Module] = None) -> nn.Module:

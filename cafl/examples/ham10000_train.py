@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from torchvision.models.detection import retinanet_resnet50_fpn_v2
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
+from torchvision.ops import box_iou
 from tqdm.auto import tqdm
 
 from cafl import (
@@ -20,7 +21,7 @@ from cafl import (
 )
 from cafl.adapters.torchvision_retinanet import swap_in_cafl_head
 from cafl.examples.ham10000_detection import (
-    HAM10000Detection, DEFAULT_CLASS_MAP, det_collate
+    HAM10000Detection, DEFAULT_CLASS_MAP, DEFAULT_SEVERITY_MAP, det_collate
 )
 
 #helps with fragmented memory on long runs
@@ -32,17 +33,8 @@ except Exception:
     pass
 
 # ------------- Class & severity setup ----------------------------------------
-CLASS_MAP = DEFAULT_CLASS_MAP 
-
-SEVERITY = {
-    "akiec": 3,
-    "bcc":   3,
-    "bkl":   1,
-    "df":    1,
-    "nv":    1,
-    "mel":   4,   # melanoma urgent
-    "vasc":  2,
-}
+CLASS_MAP = DEFAULT_CLASS_MAP
+SEVERITY = DEFAULT_SEVERITY_MAP
 SEVERITY_ID = {CLASS_MAP[k]: v for k, v in SEVERITY.items()}
 
 # ------------- Minimal training params ---------------------------------------
@@ -232,32 +224,16 @@ def configure_wandb_metrics(wandb_run) -> None:
         "train/loss",
         "train/cls_loss",
         "train/bbox_loss",
+        "train/alpha_mean",
+        "train/phi_mean",
+        "val/mel_recall",
+        "val/mel_precision",
+        "val/overall_recall",
+        "val/overall_precision",
+        "val/severity_weighted_fn",
+        "val/total_gt",
     ):
         wandb_run.define_metric(metric, step_metric="epoch")
-
-def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-    """
-    Compute pairwise IoU between two sets of boxes.
-    boxes1: (N, 4), boxes2: (M, 4) in (x1, y1, x2, y2) format.
-    Returns: (N, M) IoU matrix.
-    """
-    if boxes1.numel() == 0 or boxes2.numel() == 0:
-        return boxes1.new_zeros((boxes1.size(0), boxes2.size(0)))
-
-    # areas
-    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
-    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
-
-    # intersections
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])   # (N, M, 2)
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])   # (N, M, 2)
-    wh = (rb - lt).clamp(min=0)                          # (N, M, 2)
-    inter = wh[:, :, 0] * wh[:, :, 1]                    # (N, M)
-
-    # unions
-    union = area1[:, None] + area2 - inter
-    iou = inter / union.clamp(min=1e-6)
-    return iou
 
 
 def evaluate_detector(
@@ -266,6 +242,8 @@ def evaluate_detector(
     device: torch.device,
     iou_thresh: float = 0.5,
     score_thresh: float = 0.5,
+    class_map: Optional[Dict[str, int]] = None,
+    severity_map: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
     Simple detection evaluation:
@@ -273,9 +251,13 @@ def evaluate_detector(
     - Melanoma recall / precision.
     - Severity-weighted false negatives (sum of severity for missed GTs).
     """
+    if class_map is None:
+        class_map = CLASS_MAP
+    if severity_map is None:
+        severity_map = SEVERITY_ID
     model.eval()
-    num_classes = len(CLASS_MAP)
-    mel_class_id = CLASS_MAP["mel"]
+    num_classes = len(class_map)
+    mel_class_id = class_map["mel"]
 
     stats = {
         c: {"tp": 0, "fp": 0, "fn": 0}
@@ -320,7 +302,7 @@ def evaluate_detector(
                     # no predictions -> all GT are FN
                     for c in gt_labels.tolist():
                         stats[c]["fn"] += 1
-                        severity_weighted_fn += SEVERITY_ID.get(int(c), 1)
+                        severity_weighted_fn += severity_map.get(int(c), 1)
                     continue
 
                 # Greedy matching per class
@@ -342,7 +324,7 @@ def evaluate_detector(
                     if pred_c_boxes.numel() == 0:
                         # only GT -> all FN
                         stats[c]["fn"] += int(gt_idx.numel())
-                        severity_weighted_fn += SEVERITY_ID.get(int(c), 1) * int(gt_idx.numel())
+                        severity_weighted_fn += severity_map.get(int(c), 1) * int(gt_idx.numel())
                         continue
 
                     ious = box_iou(pred_c_boxes, gt_c_boxes)  # (P, G)
@@ -368,7 +350,7 @@ def evaluate_detector(
                     missed = gt_idx.numel() - len(matched_gt)
                     if missed > 0:
                         stats[c]["fn"] += missed
-                        severity_weighted_fn += SEVERITY_ID.get(int(c), 1) * missed
+                        severity_weighted_fn += severity_map.get(int(c), 1) * missed
 
     # derive precision / recall per class
     per_class = {}
@@ -453,8 +435,19 @@ def parse_args():
                    help="Override W&B mode (online/offline/disabled).")
     p.add_argument("--disable-cafl", action="store_true",
                    help="Skip CAFL head/losses and run vanilla RetinaNet.")
-    
-        # Loss / ablation mode
+
+    # Checkpointing
+    p.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"),
+                   help="Directory for saving checkpoints each epoch.")
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Path to a checkpoint file to resume training from.")
+
+    # LR scheduler
+    p.add_argument("--lr-scheduler", type=str, default="cosine",
+                   choices=["none", "cosine", "step"],
+                   help="LR scheduler: cosine annealing, step decay, or none.")
+
+    # Loss / ablation mode
     p.add_argument(
         "--loss-mode",
         type=str,
@@ -541,16 +534,12 @@ def main():
     image_mean = getattr(model.transform, "image_mean", [0.485, 0.456, 0.406])
     image_std  = getattr(model.transform, "image_std",  [0.229, 0.224, 0.225])
     model.transform = GeneralizedRCNNTransform(
-        min_size=450,
-        max_size=600,
+        min_size=args.min_size,
+        max_size=args.max_size,
         image_mean=image_mean,
         image_std=image_std,
         size_divisible=32
     )
-
-    cfg = None
-    cafl = None
-    similarity = None
 
     cfg = None
     cafl = None
@@ -606,6 +595,20 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # ------------------- Checkpoint resume ------------------------------------
+    start_epoch = 0
+    checkpoint_dir = args.checkpoint_dir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.resume is not None:
+        if not args.resume.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"Resumed from checkpoint: {args.resume} (epoch {ckpt['epoch']+1})")
+
     if cafl_enabled:
         # ---- Class weights according to loss-mode ----
         counts_vec = train_ds.class_counts_tensor().to(device)  # positives per class
@@ -636,20 +639,36 @@ def main():
     accum = max(1, args.accum_steps)
     warmup_freeze_epochs = cfg.warmup_freeze_epochs if cafl_enabled else 0
 
+    # ------------------- LR Scheduler ----------------------------------------
+    remaining_epochs = args.epochs - start_epoch
+    if args.lr_scheduler == "cosine" and remaining_epochs > 0:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=remaining_epochs
+        )
+    elif args.lr_scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, args.epochs // 3), gamma=0.1
+        )
+    else:
+        scheduler = None
+
     print(f"Training set size: {len(train_ds)} images, classes={num_classes}")
     print(f"FP32 training, batch_size={args.batch_size}, accum_steps={accum}, "
-          f"min/max={args.min_size}/{args.max_size}")
+          f"min/max={args.min_size}/{args.max_size}, lr_scheduler={args.lr_scheduler}")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         model.train()
         if cafl_enabled and similarity is not None and epoch == warmup_freeze_epochs:
             similarity.unfreeze()
+            print(f"  [epoch {epoch+1}] Similarity embeddings unfrozen.")
 
         running = 0.0
         steps = 0
         epoch_cls = 0.0
         epoch_bbox = 0.0
+        epoch_alpha = 0.0
+        epoch_phi = 0.0
         optimizer.zero_grad(set_to_none=True)
 
         train_bar = tqdm(
@@ -675,6 +694,13 @@ def main():
             bbox_loss = float(loss_dict["bbox_regression"].detach().cpu())
             loss_value = float(loss.detach().cpu()) * accum
 
+            # Collect CAFL diagnostic parts if available
+            cls_head = getattr(getattr(model, "head", None), "classification_head", None)
+            last_parts = getattr(cls_head, "last_parts", None)
+            if last_parts is not None:
+                epoch_alpha += float(last_parts["alpha_mean"].detach().cpu())
+                epoch_phi += float(last_parts["phi_mean"].detach().cpu())
+
             running += loss_value
             steps += 1
             epoch_cls += cls_loss
@@ -690,6 +716,8 @@ def main():
         epoch_loss = running / max(1, steps)
         epoch_cls_loss = epoch_cls / max(1, steps)
         epoch_bbox_loss = epoch_bbox / max(1, steps)
+        epoch_alpha_mean = epoch_alpha / max(1, steps)
+        epoch_phi_mean = epoch_phi / max(1, steps)
         print(f"train loss: {epoch_loss:.4f}")
 
         # (optional) simple eval stub
@@ -705,6 +733,19 @@ def main():
             )
 
 
+        if scheduler is not None:
+            scheduler.step()
+
+        # Save checkpoint
+        ckpt_path = checkpoint_dir / f"epoch_{epoch+1:03d}.pt"
+        torch.save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": vars(args),
+        }, ckpt_path)
+        print(f"Checkpoint saved: {ckpt_path}")
+
         if wandb_run:
             lr = optimizer.param_groups[0]["lr"]
             metrics = {
@@ -714,6 +755,9 @@ def main():
                 "train/bbox_loss": epoch_bbox_loss,
                 "optimizer/lr": lr,
             }
+            if epoch_alpha_mean > 0 or epoch_phi_mean > 0:
+                metrics["train/alpha_mean"] = epoch_alpha_mean
+                metrics["train/phi_mean"] = epoch_phi_mean
             if val_metrics is not None:
                 metrics.update({
                     "val/mel_recall": val_metrics["mel_recall"],
@@ -729,6 +773,25 @@ def main():
             torch.cuda.empty_cache()
 
     print("Training done.")
+
+    # Export learned similarity matrix
+    if similarity is not None:
+        W = similarity().detach().cpu()
+        sim_path = checkpoint_dir / "similarity_matrix.pt"
+        torch.save(W, sim_path)
+        print(f"Similarity matrix saved: {sim_path}")
+        if wandb_run:
+            try:
+                import wandb as _wandb
+                class_names = [k for k, v in sorted(CLASS_MAP.items(), key=lambda x: x[1])]
+                wandb_run.log({
+                    "similarity_matrix": _wandb.plots.HeatMap(
+                        x_labels=class_names, y_labels=class_names,
+                        matrix_values=W.tolist(), show_text=True,
+                    )
+                })
+            except Exception:
+                pass  # heatmap logging is best-effort
 
     if wandb_run:
         wandb_run.finish()

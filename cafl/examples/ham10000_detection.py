@@ -15,6 +15,17 @@ DEFAULT_CLASS_MAP = {
     "vasc":  6,  # Vascular lesions
 }
 
+# Clinical severity scores per class name (higher = more dangerous / urgent).
+DEFAULT_SEVERITY_MAP = {
+    "akiec": 3,
+    "bcc":   3,
+    "bkl":   1,
+    "df":    1,
+    "nv":    1,
+    "mel":   4,   # melanoma: highest priority
+    "vasc":  2,
+}
+
 def _norm_name(s: str) -> str:
     return s.strip().lower()
 

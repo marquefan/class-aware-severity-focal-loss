@@ -11,7 +11,7 @@ def effective_number_weights(
     """
     counts = counts.to(dtype=torch.float32)
     beta = float(beta)
-    w = (1.0 - beta) / (1.0 - torch.pow(torch.clamp(torch.tensor(beta), 0.0, 0.999999), counts).clamp_min(eps))
+    w = (1.0 - beta) / (1.0 - torch.pow(torch.clamp(torch.tensor(beta), 0.0, 0.999999), counts)).clamp_min(eps)
     if normalize_mean1:
         w = w * (counts.numel() / (w.sum().clamp_min(eps)))
     return w
